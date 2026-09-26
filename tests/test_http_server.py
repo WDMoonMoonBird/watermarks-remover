@@ -184,6 +184,23 @@ def test_clean_text_roundtrip(conn):
     assert body["report"]["stats"]["removed_count"] == 2
 
 
+def test_clean_text_accepts_style_option(conn):
+    # "style" is accepted + validated (string) on /clean for forward-compat, but
+    # text cleaning stays deterministic Layer A — the service holds no rewrite
+    # model, so the option is parsed and ignored for text.
+    data = "Hello\u200bWorld\u00ad!".encode("utf-8")
+    status, body = _post(
+        conn,
+        "/clean",
+        {"file": _b64(data), "name": "note.txt", "options": {"style": "write like hemingway"}},
+    )
+    assert status == 200
+    assert body["kind"] == "text"
+    cleaned = base64.b64decode(body["cleaned"]).decode("utf-8")
+    assert cleaned == "HelloWorld!"
+    assert body["report"]["stats"]["removed_count"] == 2
+
+
 def test_clean_png_strips_metadata(conn):
     data = _watermarked_png()
     status, body = _post(conn, "/clean", {"file": _b64(data), "name": "shot.png"})
@@ -352,6 +369,35 @@ def test_known_deep_images_modes_accepted(conn):
         assert status == 200, mode
 
 
+def test_unknown_clean_attachments_mode_rejected(conn):
+    """A typo must answer 400, not silently fall back to auto."""
+    status, body = _post(
+        conn,
+        "/clean",
+        {
+            "file": _b64(b"x"),
+            "name": "x.txt",
+            "options": {"clean_attachments": "sometime"},
+        },
+    )
+    assert status == 400
+    assert "clean_attachments" in body["error"]
+
+
+def test_known_clean_attachments_modes_accepted(conn):
+    for mode in sorted(container_meta.CLEAN_ATTACHMENT_MODES):
+        status, _body = _post(
+            conn,
+            "/clean",
+            {
+                "file": _b64(b"plain text\n"),
+                "name": "x.txt",
+                "options": {"clean_attachments": mode},
+            },
+        )
+        assert status == 200, mode
+
+
 @pytest.mark.parametrize(
     ("key", "value", "type_name"),
     [
@@ -362,6 +408,7 @@ def test_known_deep_images_modes_accepted(conn):
         ("strip_all_metadata", [], "boolean"),
         ("remove_pixel", False, "string"),
         ("remove_audio_watermark", "false", "boolean"),
+        ("style", 123, "string"),
     ],
 )
 def test_option_wrong_type_rejected(conn, key, value, type_name):

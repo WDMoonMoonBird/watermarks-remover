@@ -176,6 +176,16 @@ AI_GENERATOR_PRODUCTS = (
 # ...) are free text and are never scanned for product names.
 _GENERATOR_TEXT_KEYS = ("software", "creator", "parameters")
 
+# PNG text is metadata, not a document. Zip members cap at 128 MiB and
+# sitemap gzip at 64 MiB; a zTXt/iTXt value of 1 MiB is already far past
+# any legitimate Software/parameters chunk. zlib.decompress() has no
+# max_length, so this budget is enforced via decompressobj.
+MAX_PNG_TEXT_DECOMPRESSED_BYTES = 1 << 20
+
+
+class PngTextBudgetExceeded(Exception):
+    """Decompressed PNG zTXt/iTXt exceeded MAX_PNG_TEXT_DECOMPRESSED_BYTES."""
+
 
 @dataclass
 class ImageInspectReport:
@@ -244,12 +254,36 @@ def _contains_any(blob: bytes, needles: tuple[bytes, ...]) -> list[str]:
     return found
 
 
+def _zlib_decompress_bounded(data: bytes) -> bytes:
+    """Inflate zlib data, refusing output larger than the PNG-text budget.
+
+    ``zlib.decompress`` has no output cap. A crafted zTXt/iTXt chunk of a
+    few hundred KB can expand to hundreds of MB (then several more copies
+    in the marker scan). ``decompressobj.decompress(..., max_length=)``
+    stops before that allocation; callers treat ``PngTextBudgetExceeded``
+    as a refused bomb, distinct from a corrupt stream (``zlib.error``).
+    """
+    limit = MAX_PNG_TEXT_DECOMPRESSED_BYTES
+    dec = zlib.decompressobj()
+    out = dec.decompress(data, max_length=limit)
+    if not dec.eof and len(out) >= limit:
+        raise PngTextBudgetExceeded(f"PNG text decompressed size exceeds cap ({limit} bytes)")
+    extra = dec.flush()
+    if extra:
+        if len(out) + len(extra) > limit:
+            raise PngTextBudgetExceeded(f"PNG text decompressed size exceeds cap ({limit} bytes)")
+        out += extra
+    return out
+
+
 def _png_text_entries(payload: bytes, ctype: bytes) -> list[tuple[str, str]]:
     """Parse a PNG text-chunk payload into (key, value) pairs.
 
     Handles tEXt (latin-1), zTXt (zlib-compressed text), and iTXt
     (UTF-8, optionally compressed). Malformed or undecodable chunks
-    yield whatever pairs are recoverable; nothing is raised.
+    yield whatever pairs are recoverable. Over-budget compressed text
+    raises ``PngTextBudgetExceeded`` so inspect/clean can refuse the
+    chunk without allocating it.
     """
     entries: list[tuple[str, str]] = []
     if ctype == b"tEXt":
@@ -266,7 +300,7 @@ def _png_text_entries(payload: bytes, ctype: bytes) -> list[tuple[str, str]]:
         if not sep or len(rest) < 2:
             return entries
         try:
-            text = zlib.decompress(rest[1:])
+            text = _zlib_decompress_bounded(rest[1:])
         except zlib.error:
             return entries
         entries.append(
@@ -289,7 +323,7 @@ def _png_text_entries(payload: bytes, ctype: bytes) -> list[tuple[str, str]]:
             return entries
         if comp_flag == 1:
             try:
-                text = zlib.decompress(text)
+                text = _zlib_decompress_bounded(text)
             except zlib.error:
                 return entries
         entries.append(
@@ -362,7 +396,13 @@ def inspect_png(data: bytes) -> tuple[bool, bool, list[str]]:
             findings.append(f"PNG chunk {name} (possible C2PA container)")
         if ctype in (b"tEXt", b"zTXt", b"iTXt", b"eXIf"):
             if ctype in (b"tEXt", b"zTXt", b"iTXt"):
-                hits, product_hits = _png_text_hits(payload, ctype)
+                try:
+                    hits, product_hits = _png_text_hits(payload, ctype)
+                except PngTextBudgetExceeded:
+                    findings.append(
+                        f"PNG {name}: not fully inspected (decompressed text exceeds cap)"
+                    )
+                    hits, product_hits = [], []
             else:
                 hits = _contains_any(payload, AI_META_HINTS + C2PA_MARKERS)
                 product_hits = []
@@ -595,7 +635,7 @@ def inspect_isobmff(data: bytes, fmt: str = "avif") -> tuple[bool, bool, list[st
     has_c2pa = False
     has_ai = False
 
-    boxes, _ = _parse_isobmff_boxes(data)
+    boxes, scanned_end = _parse_isobmff_boxes(data)
     if not boxes:
         # Box parsing failed (e.g. the first box's size overruns a truncated
         # download) — that is exactly when the whole-file byte scan below is
@@ -675,11 +715,15 @@ def inspect_isobmff(data: bytes, fmt: str = "avif") -> tuple[bool, bool, list[st
                             has_c2pa = True
                         findings.append(f"{fmt.upper()} meta/{s_name}: {', '.join(hits[:8])}")
 
+    # A raw hit in a fully parsed media payload is not manifest evidence: any
+    # compressed stream can coincidentally contain these short ASCII markers.
+    # Keep the whole-file scan as a recovery path only when box walking stopped
+    # early, which covers truncated containers such as #167/#176.
     whole = _contains_any(data, C2PA_MARKERS)
-    if whole and not has_c2pa:
+    if whole and not has_c2pa and scanned_end < len(data):
         has_c2pa = True
         findings.append(f"byte-scan C2PA markers: {', '.join(whole[:6])}")
-    elif _contains_c2pa_prov_box(data) and not has_c2pa:
+    elif scanned_end < len(data) and _contains_c2pa_prov_box(data) and not has_c2pa:
         # A C2PA content-provenance uuid box whose manifest bytes carry no
         # ASCII 'c2pa'/'jumb' marker (e.g. an auxiliary "merkle" box, or a
         # truncated manifest) is still a manifest box; catch it by user type.
@@ -1645,7 +1689,7 @@ def run_markdiffusion_purify(
     output: Path,
     *,
     upstream_dir: str | None = None,
-    strength: float = 0.3,
+    intensity: float = 0.3,
     model: str | None = None,
     size: int = 512,
     steps: int = 50,
@@ -1676,8 +1720,8 @@ def run_markdiffusion_purify(
         str(path),
         "-o",
         str(output),
-        "--purification-strength",
-        str(strength),
+        "--purification-intensity",
+        str(intensity),
         "--size",
         str(size),
         "--steps",
@@ -1727,7 +1771,7 @@ def run_ctrlregen_clean(
     output: Path,
     *,
     upstream_dir: str | None = None,
-    strength: float = 0.25,
+    intensity: float = 0.25,
     steps: int = 50,
     device: str | None = None,
     seed: int | None = None,
@@ -1760,8 +1804,8 @@ def run_ctrlregen_clean(
         str(output),
         "--upstream-dir",
         str(upstream),
-        "--strength",
-        str(strength),
+        "--intensity",
+        str(intensity),
         "--steps",
         str(steps),
         "--json",
@@ -1921,9 +1965,14 @@ def strip_png(data: bytes, *, strip_all_text: bool = True) -> tuple[bytes, list[
             drop = True
             actions.append(f"drop chunk {name}")
         elif ctype in (b"tEXt", b"zTXt", b"iTXt"):
-            if strip_all_text or _text_chunk_is_ai(payload, ctype):
+            try:
+                drop = strip_all_text or _text_chunk_is_ai(payload, ctype)
+            except PngTextBudgetExceeded:
                 drop = True
-                actions.append(f"drop chunk {name}")
+                actions.append(f"drop chunk {name} (decompressed text exceeds cap)")
+            else:
+                if drop:
+                    actions.append(f"drop chunk {name}")
         elif _contains_any(ctype + payload, C2PA_MARKERS) and ctype not in (
             b"IHDR",
             b"IDAT",
@@ -2171,13 +2220,13 @@ def clean_image(
     synthid_dir: str | None = None,
     remove_pixel: str | None = None,
     ctrlregen_dir: str | None = None,
-    ctrlregen_strength: float = 0.25,
+    ctrlregen_intensity: float = 0.25,
     ctrlregen_steps: int = 50,
     ctrlregen_device: str | None = None,
     ctrlregen_seed: int | None = None,
     ctrlregen_timeout: int = 3600,
     markdiffusion_dir: str | None = None,
-    markdiffusion_strength: float = 0.3,
+    markdiffusion_intensity: float = 0.3,
     markdiffusion_model: str | None = None,
     markdiffusion_size: int = 512,
     markdiffusion_steps: int = 50,
@@ -2234,14 +2283,14 @@ def clean_image(
                 dest,
                 dest,
                 upstream_dir=ctrlregen_dir,
-                strength=ctrlregen_strength,
+                intensity=ctrlregen_intensity,
                 steps=ctrlregen_steps,
                 device=ctrlregen_device,
                 seed=ctrlregen_seed,
                 timeout=ctrlregen_timeout,
             )
             if pixel_removal.get("available"):
-                actions.append(f"CtrlRegen pixel removal (strength {ctrlregen_strength})")
+                actions.append(f"CtrlRegen pixel removal (intensity {ctrlregen_intensity})")
             else:
                 actions.append(
                     "CtrlRegen pixel removal skipped: "
@@ -2252,7 +2301,7 @@ def clean_image(
                 dest,
                 dest,
                 upstream_dir=markdiffusion_dir,
-                strength=markdiffusion_strength,
+                intensity=markdiffusion_intensity,
                 model=markdiffusion_model,
                 size=markdiffusion_size,
                 steps=markdiffusion_steps,
@@ -2261,7 +2310,7 @@ def clean_image(
             )
             if pixel_removal.get("available"):
                 actions.append(
-                    f"DiffusionPurification pixel removal (strength {markdiffusion_strength})"
+                    f"DiffusionPurification pixel removal (intensity {markdiffusion_intensity})"
                 )
             else:
                 actions.append(

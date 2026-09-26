@@ -49,7 +49,12 @@ CONTAINER_EXTS = {
     ".md",
     ".markdown",
     ".mdx",
+    ".tex",
+    ".ltx",
 }
+#: Plain-text formats the Layer A scanner reads and the clean hooks rewrite. An
+#: absent suffix is left unread and unrouted, so keep this table broad: every
+#: entry only has to decode as text.
 TEXT_EXTS = {
     ".txt",
     ".text",
@@ -70,6 +75,54 @@ TEXT_EXTS = {
     ".yml",
     ".toml",
     ".csv",
+    # Compiled, JVM and systems languages
+    ".c",
+    ".h",
+    ".cpp",
+    ".cc",
+    ".hpp",
+    ".cs",
+    ".java",
+    ".kt",
+    ".kts",
+    ".swift",
+    ".scala",
+    ".dart",
+    # Scripting languages
+    ".rb",
+    ".php",
+    ".lua",
+    ".pl",
+    ".r",
+    # Shell and query languages
+    ".sh",
+    ".bash",
+    ".zsh",
+    ".ps1",
+    ".sql",
+    # Single-file web components
+    ".vue",
+    ".svelte",
+    ".astro",
+    # Prose and documentation markup
+    ".rst",
+    ".adoc",
+    ".asciidoc",
+    ".org",
+    # Localization resources: where user-facing strings actually live. Text is
+    # read as UTF-8, so this covers UTF-8 .po/.pot/.arb; UTF-16 .strings still
+    # needs the BOM-aware decoder.
+    ".po",
+    ".pot",
+    ".strings",
+    ".arb",
+    ".resx",
+    ".properties",
+    # Config and tabular data
+    ".ini",
+    ".cfg",
+    ".conf",
+    ".tsv",
 }
 
 
